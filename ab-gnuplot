@@ -1,0 +1,1067 @@
+#!/usr/bin/env php
+<?php
+
+class ABGPException extends RuntimeException
+{
+    protected function __construct(string $message, int $code)
+    {
+        parent::__construct($message, $code);
+    }
+
+    public static function abortedByUser(): self
+    {
+        return new static('Aborted.', 0);
+    }
+
+    public static function unexpected(string $message): self
+    {
+        return new static($message, 1);
+    }
+
+    public static function invalidOptionValue(string $optionName, string $message): self
+    {
+        return new static("Invalid value of the {$optionName} option: {$message}", 2);
+    }
+
+    public static function unrecognizedOptions(array $unrecognizedOptions): self
+    {
+        return new static('Unrecognized options: ' . implode(' ', $unrecognizedOptions), 3);
+    }
+
+    public static function commandMissing(string $command, string $instructions = ''): self
+    {
+        $message = "Could not find the program {$command} in the PATH environment variable.";
+        if ($instructions !== '') {
+            $message .= "\n{$instructions}";
+        }
+
+        return new static($message, 4);
+    }
+
+    public static function generic(string $message): self
+    {
+        return new static($message, 255);
+    }
+}
+
+set_error_handler(
+    static function ($errno, $errstr, $errfile, $errline) {
+        throw ABGPException::unexpectedRuntimeException(
+            <<<EOT
+Error {$errno}: {$errstr}
+File: {$errfile}
+Line: {$errline}
+
+EOT
+        );
+    }
+);
+
+const OPTION_NUMCYCLES = '--cycles';
+const OPTION_OUTPUTFILE = '--output';
+const OPTION_OVERWRITEOUTPUTFILE = '--overwrite';
+const OPTION_OUTPUTSIZE = '--size';
+const OPTION_KIND = '--kind';
+const OPTION_REPODIR = '--dir';
+const KIND_SWITCHBRANCH = 'branch';
+const KIND_DIFFERENTURLS = 'url';
+const OPTION_URL = '--url';
+const OPTION_IP = '--ip';
+const OPTION_COMPOSER = '--composer';
+const OPTION_BRANCH = '--branch';
+
+class Args
+{
+    private static $instance;
+
+    private $scriptName;
+
+    private $values;
+
+    public function __construct()
+    {
+        $this->parse($_SERVER['argv']);
+    }
+
+    public function getScriptName(): string
+    {
+        return $this->scriptName;
+    }
+
+    public function get(string $key): ?string
+    {
+        return $this->values[$key] ?? null;
+    }
+
+    public function pop(string $key): ?string
+    {
+        $result = $this->get($key);
+        unset($this->values[$key]);
+
+        return $result;
+    }
+
+    public function getBool(string $key): ?bool
+    {
+        $value = $this->get($key);
+        if ($value === null) {
+            return null;
+        }
+        switch (strtolower($value)) {
+            case 'y':
+            case 'yes':
+            case '1':
+                return true;
+            case 'n':
+            case 'no':
+            case '0':
+                return false;
+        }
+        throw ABGPException::invalidOptionValue($key, "allowed values are: y, yes, 1, n, no, 0, you provided '{$value}'");
+    }
+
+    public function popBool(string $key): ?bool
+    {
+        $result = $this->getBool($key);
+        unset($this->values[$key]);
+
+        return $result;
+    }
+
+    public function getKeys(): array
+    {
+        return array_keys($this->values);
+    }
+
+    protected function parse(array $argv): void
+    {
+        $this->scriptName = (string) array_shift($argv);
+        $this->values = [];
+        foreach ($argv as $arg) {
+            if ($this->scriptName) {
+                $chunks = explode('=', $arg, 2);
+            }
+            $this->values[$chunks[0]] = $chunks[1] ?? '';
+        }
+    }
+}
+
+class UrlAndIP
+{
+    private $url;
+
+    private $ip;
+
+    public function __construct(string $url, string $ip = '')
+    {
+        $this->url = $url;
+        $this->ip = $ip;
+    }
+
+    public function getUrl(): string
+    {
+        return $this->url;
+    }
+
+    public function getIP(): string
+    {
+        return $this->ip;
+    }
+}
+
+class DNSConfigurator
+{
+    private $site;
+
+    private $hosts;
+
+    public function __construct(UrlAndIP $site, $autostart = true)
+    {
+        $this->site = $site;
+        if ($autostart) {
+            $this->start();
+        }
+    }
+
+    public function __destruct()
+    {
+        $this->stop();
+    }
+
+    public function start(): void
+    {
+        $this->stop();
+        $ip = $this->site->getIP();
+        if ($ip === '') {
+            return;
+        }
+        set_error_handler(static function () {}, -1);
+        $host = parse_url($this->site->getUrl(), PHP_URL_HOST);
+        $hosts = file_get_contents('/etc/hosts');
+        restore_error_handler();
+        if (!$host) {
+            throw ABGPException::generic("Failed to extract host name from {$host}");
+        }
+        if (!is_string($hosts)) {
+            throw ABGPException::generic('Failed to read from /etc/hosts');
+        }
+        $hostsNew = "{$ip} {$host}\n{$hosts}";
+        set_error_handler(static function () {}, -1);
+        $written = file_put_contents('/etc/hosts', $hostsNew);
+        restore_error_handler();
+        if (!$written) {
+            throw ABGPException::generic('Failed to write to /etc/hosts');
+        }
+        $this->hosts = $hosts;
+    }
+
+    public function stop(): void
+    {
+        $hosts = $this->hosts;
+        $this->hosts = null;
+        if ($hosts !== null) {
+            file_put_contents('/etc/hosts', $hosts);
+        }
+    }
+}
+
+abstract class Alternative
+{
+    protected const WARMUP_CYCLES = 5;
+
+    private $site;
+
+    private $lastBenchmarkFile;
+
+    protected function __construct(UrlAndIP $site)
+    {
+        $this->site = $site;
+    }
+
+    public function __destruct()
+    {
+        $this->deleteLastBenchmarkFile();
+    }
+
+    abstract public function getName(): string;
+
+    public function getSite(): UrlAndIP
+    {
+        return $this->site;
+    }
+
+    abstract public function getRedoOptions(int $index): string;
+
+    public function run(int $numCycles): void
+    {
+        $this->prepareRun();
+        $dnsConfigurator = new DNSConfigurator($this->getSite());
+        try {
+            echo 'Checking response... ';
+            $this->checkResponse();
+            echo " done.\n";
+            echo 'Warm-up... ';
+            $this->warmUp();
+            echo " done.\n";
+            echo 'Checking response... ';
+            $this->checkResponse();
+            echo " done.\n";
+            $tempFile = createTemporaryFile();
+            $rc = -1;
+            echo "Running {$numCycles} cycles\n";
+            passthru("ab -c 1 -n {$numCycles} -g " . escapeshellarg($tempFile) . ' ' . escapeshellarg($this->getSite()->getUrl()), $rc);
+            if ($rc !== 0) {
+                throw ABGPException::generic('ab failed!');
+            }
+            echo "Benchmark done.\n";
+            $this->lastBenchmarkFile = $tempFile;
+            $tempFile = null;
+        } finally {
+            if (isset($tempFile)) {
+                set_error_handler(static function () {}, -1);
+                unlink($tempFile);
+                restore_error_handler();
+            }
+            $dnsConfigurator->stop();
+        }
+    }
+
+    public function getLastBenchmarkFile(): ?string
+    {
+        return $this->lastBenchmarkFile;
+    }
+
+    abstract protected function prepareRun(): void;
+
+    protected function checkResponse(): void
+    {
+        $context = stream_context_create([
+            // http://docs.php.net/manual/en/context.http.php
+            'http' => [
+                'follow_location' => 0,
+                'timeout' => 10,
+                'ignore_errors' => true,
+            ],
+        ]);
+        set_error_handler(static function () {}, -1);
+        $response = file_get_contents($this->getSite()->getUrl(), false, $context);
+        restore_error_handler();
+        if ($response === false) {
+            throw ABGPException::generic("Failed to GET {$this->getSite()->getUrl()} in 10 seconds");
+        }
+        /**
+         * @var array $http_response_header
+         */
+        $matches = null;
+        if (!preg_match('/ (?<code>\d\d\d) \w/', $http_response_header[0] ?? '', $matches)) {
+            throw ABGPException::generic("Failed to determine the HTTP response code for {$this->getSite()->getUrl()}");
+        }
+        $code = (int) $matches['code'];
+        if ($code !== 200) {
+            throw ABGPException::generic("A GET request to {$this->getSite()->getUrl()} returned a non-200 error code ({$code})");
+        }
+    }
+
+    protected function warmUp(): void
+    {
+        $rc = -1;
+        $output = [];
+        exec('ab -c 1 -n ' . static::WARMUP_CYCLES . ' ' . escapeshellarg($this->getSite()->getUrl()) . ' 2>&1', $output, $rc);
+        if ($rc !== 0) {
+            throw ABGPException::generic("ab failed!\n" . trim(implode("\n", $output)));
+        }
+    }
+
+    protected function deleteLastBenchmarkFile(): void
+    {
+        if ($this->lastBenchmarkFile === null) {
+            return;
+        }
+        set_error_handler(static function () {}, -1);
+        unlink($this->lastBenchmarkFile);
+        restore_error_handler();
+        $this->lastBenchmarkFile = null;
+    }
+}
+
+class SwitchAlternative extends Alternative
+{
+    private $repoDir;
+
+    private $branchName;
+
+    private $runComposerInstall;
+
+    public function __construct(UrlAndIP $site, string $repoDir, string $branchName, bool $runComposerInstall)
+    {
+        parent::__construct($site);
+        $this->repoDir = $repoDir;
+        $this->branchName = $branchName;
+        $this->runComposerInstall = $runComposerInstall;
+    }
+
+    public function getRepoDir(): string
+    {
+        return $this->repoDir;
+    }
+
+    public function getBranchName(): string
+    {
+        return $this->branchName;
+    }
+
+    public function isRunComposerInstall(): bool
+    {
+        return $this->runComposerInstall;
+    }
+
+    public function getName(): string
+    {
+        return $this->getBranchName();
+    }
+
+    public function getRedoOptions(int $index): string
+    {
+        $chunks = [];
+        if ($index === 0) {
+            $chunks = [
+                OPTION_REPODIR . '=' . escapeshellarg($this->getRepoDir()),
+                OPTION_URL . '=' . escapeshellarg($this->getSite()->getUrl()),
+                OPTION_IP . '=' . escapeshellarg($this->getSite()->getIP()),
+                OPTION_COMPOSER . '=' . ($this->isRunComposerInstall() ? 'y' : 'n'),
+            ];
+        } else {
+            $chunks = [];
+        }
+        $chunks[] = OPTION_BRANCH . ($index + 1) . '=' . $this->getBranchName();
+
+        return implode(' ', $chunks);
+    }
+
+    protected function prepareRun(): void
+    {
+        echo "Switching to branch {$this->getBranchName()}... ";
+        $rc = -1;
+        $output = [];
+        exec('git -C ' . escapeshellarg($this->getRepoDir()) . ' checkout ' . escapeshellarg($this->getBranchName()) . ' 2>&1', $output, $rc);
+        if ($rc !== 0) {
+            throw ABGPException::generic("git failed!\n" . trim(implode("\n", $output)));
+        }
+        echo " done.\n";
+        if ($this->isRunComposerInstall()) {
+            echo 'Running composer install... ';
+            $rc = -1;
+            $output = [];
+            exec('composer install --no-progress --ignore-platform-reqs --no-ansi --no-interaction --working-dir=' . escapeshellarg($this->getRepoDir()) . ' --no-cache 2>&1', $output, $rc);
+            if ($rc !== 0) {
+                throw ABGPException::generic("composer failed!\n" . trim(implode("\n", $output)));
+            }
+            echo " done.\n";
+        }
+    }
+}
+
+class UrlAlternative extends Alternative
+{
+    public function __construct(UrlAndIP $site)
+    {
+        parent::__construct($site);
+    }
+
+    public function getName(): string
+    {
+        return $this->getSite()->getUrl();
+    }
+
+    public function getRedoOptions(int $index): string
+    {
+        $chunks = [
+            OPTION_URL . ($index + 1) . '=' . escapeshellarg($this->getSite()->getUrl()),
+            OPTION_IP . ($index + 1) . '=' . $this->getSite()->getIP(),
+        ];
+
+        return implode(' ', $chunks);
+    }
+
+    protected function prepareRun(): void
+    {
+        echo "Benchmarking {$this->getSite()->getUrl()}\n";
+    }
+}
+
+function showSyntax(Args $args): void
+{
+    fprintf(
+        STDOUT,
+        <<<'EOT'
+Syntax: %1$s [%2$s=<number of cycles>] [%3$s=<output file>] [%4$s=<y|n>] [%5$s=<width>x<height>] [%6$s=%7$s]
+
+EOT
+        ,
+        $args->getScriptName(),
+        OPTION_NUMCYCLES,
+        OPTION_OUTPUTFILE,
+        OPTION_OVERWRITEOUTPUTFILE,
+        OPTION_OUTPUTSIZE,
+        OPTION_KIND,
+        implode('|', [KIND_SWITCHBRANCH, KIND_DIFFERENTURLS])
+    );
+    fprintf(
+        STDOUT,
+        <<<'EOT'
+
+When %1$s is %2$s:
+  %3$s=<path> the path to the repository directory
+  %4$s=<url> the URL to the website
+  %5$s=<d|ip> the IP of the website (empty: use DNS, d: use the docker host)
+  %6$s=<y|n> run "composer install" after switching branches?
+  %7$s<1...n>=<branch> the names of the branches to be tested
+
+EOT
+        ,
+        OPTION_KIND,
+        KIND_SWITCHBRANCH,
+        OPTION_REPODIR,
+        OPTION_URL,
+        OPTION_IP,
+        OPTION_COMPOSER,
+        OPTION_BRANCH
+    );
+    fprintf(
+        STDOUT,
+        <<<'EOT'
+
+When %1$s is %2$s:
+  %3$s<1...n>=<url> the URL to the website #n
+  %4$s=<d|ip> the IP of the website #n (empty: use DNS, d: use the docker host)
+
+EOT
+        ,
+        OPTION_KIND,
+        KIND_DIFFERENTURLS,
+        OPTION_URL,
+        OPTION_IP
+    );
+}
+
+function readchar(string $prompt): ?string
+{
+    if (!function_exists('readline_callback_handler_install') || !function_exists('readline_callback_handler_remove')) {
+        return null;
+    }
+    readline_callback_handler_install($prompt, static function () {});
+    try {
+        return (string) stream_get_contents(STDIN, 1);
+    } finally {
+        readline_callback_handler_remove();
+    }
+}
+
+function getDockerHostIP(): string
+{
+    static $hostIP;
+    if (isset($hostIP)) {
+        return $hostIP;
+    }
+    $name = 'host.docker.internal';
+    set_error_handler(static function () {}, -1);
+    $ip = gethostbyname($name);
+    restore_error_handler();
+    if (empty($ip) || $ip === $name) {
+        throw ABGPException::generic("Failed to get the IP address of {$name}");
+    }
+    $hostIP = $ip;
+
+    return $hostIP;
+}
+
+function createTemporaryFile(): string
+{
+    set_error_handler(static function () {}, -1);
+    $systemTemporaryDirectory = (string) sys_get_temp_dir();
+    if ($systemTemporaryDirectory !== '') {
+        $temporaryFile = tempnam($systemTemporaryDirectory, 'abg');
+    }
+    restore_error_handler();
+    if ($systemTemporaryDirectory === '') {
+        throw ABGPException::generic('Failed to retrieve the system temporary directory');
+    }
+    if (!$temporaryFile) {
+        throw ABGPException::generic('Failed to create a temporary file');
+    }
+
+    return str_replace('/', DIRECTORY_SEPARATOR, $temporaryFile);
+}
+
+function commandExists(string $command): bool
+{
+    $output = [];
+    $rc = -1;
+    if (DIRECTORY_SEPARATOR === '\\') {
+        exec('WHERE ' . escapeshellarg($command) . ' >NUL 2>NUL', $output, $rc);
+    } else {
+        exec('command -v ' . escapeshellarg($command) . ' >/dev/null 2>/dev/null', $output, $rc);
+    }
+
+    return $rc === 0;
+}
+
+function getGitBranches(string $repoDir, bool $refresh = false): array
+{
+    static $branches;
+    if (!isset($branches)) {
+        $branches = [];
+    }
+    if (isset($branches[$repoDir]) && $refresh === false) {
+        return $branches[$repoDir];
+    }
+    $rc = -1;
+    $output = [];
+    exec('git -C ' . escapeshellarg($repoDir) . " branch --list --no-color --sort='-committerdate' --format='%(refname:short)' 2>&1", $output, $rc);
+    if ($rc !== 0) {
+        throw ABGPException::generic("Failed to list the local branches in {$repoDir}: " . trim(implode("\n", $output)));
+    }
+    $output = array_values(array_filter(
+        $output,
+        static function (string $line) {
+            return $line !== '';
+        }
+    ));
+    if ($output === []) {
+        throw ABGPException::generic("Failed to list the local branches in {$repoDir}: no branches detected");
+    }
+    $branches[$repoDir] = $output;
+
+    return $branches[$repoDir];
+}
+
+function showMenu(string $question, array $options): string
+{
+    echo $question, "\n";
+    $keys = array_keys($options);
+    $singleChar = true;
+    foreach (array_keys($keys) as $keyIndex) {
+        $digit = $keyIndex + 1;
+        echo $digit, ') ' . $options[$keys[$keyIndex]], "\n";
+        if ($digit >= 10) {
+            $singleChar = false;
+        }
+    }
+    echo "x|ESC) exit\n";
+    echo 'Your choice: ';
+    for (;;) {
+        $choiche = $singleChar ? readchar('') : null;
+        if ($choiche === null) {
+            $singleChar = false;
+            $choiche = trim(fgets(STDIN));
+        }
+        if ($choiche === 'x' || $choiche === "\x1B") {
+            throw ABGPException::abortedByUser();
+        }
+        $i = (int) $choiche;
+        if ($choiche !== (string) $i || !isset($keys[$i - 1])) {
+            continue;
+        }
+        if ($singleChar) {
+            echo "{$choiche}\n";
+        }
+
+        return $keys[$i - 1];
+    }
+}
+
+function askYesNo(string $question): bool
+{
+    echo $question, ' [y/n, x or ESC to abort] ';
+    $singleChar = true;
+    for (;;) {
+        $choiche = $singleChar ? readchar('') : null;
+        if ($choiche === null) {
+            $singleChar = false;
+            $choiche = trim(fgets(STDIN));
+        }
+        if ($choiche === 'x' || $choiche === "\x1B") {
+            throw ABGPException::abortedByUser();
+        }
+        switch (strtolower($choiche)) {
+            case 'y':
+                if ($singleChar) {
+                    echo "{$choiche}\n";
+                }
+
+                return true;
+            case 'n':
+                if ($singleChar) {
+                    echo "{$choiche}\n";
+                }
+                echo "{$choiche}\n";
+
+                return false;
+            default:
+                if (!$singleChar) {
+                    echo 'Please answer with y, n or x: ';
+                }
+                break;
+        }
+    }
+}
+
+function getNumCycles(Args $args): int
+{
+    $numCycles = $args->pop(OPTION_NUMCYCLES);
+    if ($numCycles !== null) {
+        $i = (int) $numCycles;
+        if ($i < 1) {
+            throw ABGPException::invalidOptionValue(OPTION_NUMCYCLES, "it must be a positive integer, you provided '{$numCycles}'");
+        }
+
+        return $i;
+    }
+    echo 'Specify the number of cycles to be executed: ';
+    for (;;) {
+        $numCycles = (int) trim(fgets(STDIN));
+        if ($numCycles > 0) {
+            return $numCycles;
+        }
+        echo 'Please enter a positive integer: ';
+    }
+}
+
+function getOutputFile(Args $args): string
+{
+    $outputFile = $args->pop(OPTION_OUTPUTFILE);
+    if ($outputFile === null) {
+        $fromOptions = false;
+        echo 'Specify the number path to the output file: ';
+        $outputFile = fgets(STDIN);
+    } else {
+        $fromOptions = true;
+        $outputFile = $outputFile;
+    }
+    $overwrite = $args->popBool(OPTION_OVERWRITEOUTPUTFILE);
+    for (;;) {
+        $outputFile = str_replace('/', DIRECTORY_SEPARATOR, trim($outputFile));
+        $error = null;
+        if ($outputFile === '') {
+            $error = "The path of the output file can't be empty.";
+        } else {
+            if (file_exists($outputFile)) {
+                if (is_dir($outputFile)) {
+                    $error = "{$outputFile} is a directory: you must specify a file.";
+                } else {
+                    if ($overwrite === null) {
+                        $overwrite = askYesNo("The file {$outputFile} already exists. Do you want to overwrite it?");
+                    }
+                    if (!$overwrite) {
+                        $error = "The file {$outputFile} won't be overwritten";
+                    }
+                }
+            }
+        }
+        if ($error === null) {
+            set_error_handler(static function () {}, -1);
+            $written = file_put_contents($outputFile, ' ');
+            unlink($outputFile);
+            restore_error_handler();
+            if ($written) {
+                return $outputFile;
+            }
+            $error = "Error writing to {$outputFile}";
+        }
+        if ($fromOptions) {
+            throw ABGPException::invalidOptionValue(OPTION_OUTPUTFILE, $error);
+        }
+        echo "{$error}\nTry again: ";
+        $outputFile = trim(fgets(STDIN));
+    }
+}
+
+function getOutputSize(Args $args): array
+{
+    $sizeString = $args->pop(OPTION_OUTPUTSIZE);
+    if ($sizeString === null) {
+        return [640, 480];
+    }
+    $matches = null;
+    if (!preg_match('/^(?<x>[1-9]\d*)x(?<y>[1-9]\d*)$/i', $sizeString, $matches)) {
+        throw ABGPException::invalidOptionValue(OPTION_OUTPUTSIZE, "it must be the in the form <width>x<height> (eg 640x400), but you provided '{$sizeString}'");
+    }
+
+    return [(int) $matches['x'], (int) $matches['y']];
+}
+
+function getKind(Args $args): string
+{
+    $kind = $args->pop(OPTION_KIND);
+    if ($kind !== null) {
+        $kind = strtolower($kind);
+        $kinds = [KIND_SWITCHBRANCH, KIND_DIFFERENTURLS];
+        if (!in_array($kind, $kinds, true)) {
+            throw ABGPException::invalidOptionValue(OPTION_KIND, 'valid values are: ' . implode(', ', $kinds) . ", you provided '{$kind}'");
+        }
+    } else {
+        $kind = showMenu(
+            'Which kind of comparision would you like to do?',
+            [
+                KIND_SWITCHBRANCH => 'Call the same URL, but switch between git branches',
+                KIND_DIFFERENTURLS => 'Call different URLs',
+            ]
+        );
+    }
+
+    return $kind;
+}
+
+function getSite(Args $args, ?int $index = null, bool $onlyIfAutomatic = false): ?UrlAndIP
+{
+    $url = $args->pop(OPTION_URL . $index);
+    if ($url !== null) {
+        if (filter_var($url, FILTER_VALIDATE_URL) === false) {
+            throw ABGPException::invalidOptionValue(OPTION_URL, "{$url} is not a valid URL");
+        }
+    } else {
+        if ($onlyIfAutomatic) {
+            return null;
+        }
+        $required = $index === null || $index === 1;
+        $prefix = $index === null ? 'Specify the URL to be called' : "Specify the URL #{$index} to be called";
+        echo $prefix, $required ? ' (CTRL-C to quit): ' : ', empty string to stop (CTRL-C to quit): ';
+        for (;;) {
+            $url = trim(fgets(STDIN));
+            if ($required === false && $url === '') {
+                return null;
+            }
+            if (filter_var($url, FILTER_VALIDATE_URL) !== false) {
+                break;
+            }
+            echo 'Invalid URL. Try again: ';
+        }
+    }
+    if (preg_match('_^\w+://[^/]+$_', $url)) {
+        $url .= '/';
+    }
+    $ip = $args->pop(OPTION_IP . $index);
+    if ($ip !== null) {
+        if (strcasecmp($ip, 'd') === 0) {
+            $ip = getDockerHostIP();
+        } elseif ($ip !== '' && filter_var($ip, FILTER_VALIDATE_IP) === false) {
+            throw ABGPException::invalidOptionValue(OPTION_URL, "{$ip} is not a IP address");
+        }
+    } elseif (preg_match('_^\w+://(?<ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b_i', $url)) {
+        $ip = '';
+    } else {
+        echo 'If required, specify the IP at witch the website is available (d to use your PC, CTRL-C to quit): ';
+        for (;;) {
+            $ip = trim(fgets(STDIN));
+            if (strcasecmp($ip, 'd') === 0) {
+                $ip = getDockerHostIP();
+            } elseif ($ip !== '' && filter_var($url, FILTER_VALIDATE_IP) === false) {
+                echo 'Invalid IP. Try again: ';
+                continue;
+            }
+            break;
+        }
+    }
+
+    return new UrlAndIP($url, $ip);
+}
+
+function askBranchName(string $repoDir, int $index): string
+{
+    $branchNames = getGitBranches($repoDir);
+
+    return showMenu("Please enter the branch name for the alternative #{$index}", array_combine($branchNames, $branchNames) + ($index === 1 ? [] : ['' => 'Stop']));
+}
+
+function getRepoDir(Args $args): string
+{
+    $repoDir = $args->pop(OPTION_REPODIR);
+    if ($repoDir === null) {
+        $fromOptions = false;
+        echo 'Please specify the directory containing the git repository: ';
+        $repoDir = trim(fgets(STDIN));
+    } else {
+        $fromOptions = true;
+        $repoDir = trim($repoDir);
+    }
+    for (;;) {
+        if ($repoDir === '') {
+            $error = "The path to repository directory can't be empty.";
+        } else {
+            $repoDir = rtrim(str_replace('/', DIRECTORY_SEPARATOR, $repoDir), DIRECTORY_SEPARATOR);
+            if (!is_dir($repoDir)) {
+                $error = "The directory '{$repoDir}' doesn't exist.";
+            } elseif (!is_file("{$repoDir}/.git/config")) {
+                $error = "The directory '{$repoDir}' is not the root of a git repository";
+            } else {
+                return $repoDir;
+            }
+        }
+        if ($fromOptions) {
+            throw ABGPException::invalidOptionValue(OPTION_REPODIR, $error);
+        }
+        echo "{$error}\nTry again: ";
+        $repoDir = trim(fgets(STDIN));
+    }
+}
+
+/**
+ * @return SwitchAlternative[]
+ */
+function geSwitchAlternatives(Args $args): array
+{
+    $repoDir = getRepoDir($args);
+    $site = getSite($args);
+    $result = [];
+    $branchNames = getGitBranches($repoDir);
+    $composer = $args->popBool(OPTION_COMPOSER);
+    if ($composer === null) {
+        $composer = askYesNo('Do you want to run "composer install" when switching between branches?');
+    }
+    if ($composer === true) {
+        if (!commandExists('composer')) {
+            throw ABGPException::commandMissing(
+                'composer',
+                "Please install composer - see https://getcomposer.org/\n" . (
+                    DIRECTORY_SEPARATOR === '\\' ?
+                    'You need then need to create a composer.bat file that calls composer.phar, then add it to a directory listed your PATH environment variable' :
+                    "You then need to rename is as 'composer', then add it to a directory listed your PATH environment variable"
+                )
+            );
+        }
+    }
+    for ($index = 1;; $index++) {
+        $branchName = $args->pop(OPTION_BRANCH . $index);
+        if ($branchName === null) {
+            break;
+        }
+        if (!in_array($branchName, $branchNames, true)) {
+            $branchNames = implode("\n- ", $branchNames);
+            throw ABGPException::invalidOptionValue(OPTION_BRANCH . $index, "Invalid branch name: {$branchName}\nAvailable branches are:\n- {$branchNames}");
+        }
+        $result[] = new SwitchAlternative($site, $repoDir, $branchName, $composer);
+    }
+    if ($result === []) {
+        for ($index = 1;; $index++) {
+            $branchName = askBranchName($repoDir, $index);
+            if ($branchName === '') {
+                break;
+            }
+            $result[] = new SwitchAlternative($site, $repoDir, $branchName, $composer);
+        }
+    }
+
+    return $result;
+}
+
+/**
+ * @return UrlAlternative[]
+ */
+function getUrlAlternatives(Args $args): array
+{
+    $result = [];
+    for ($index = 1;; $index++) {
+        $site = getSite($args, $index, true);
+        if ($site === null) {
+            break;
+        }
+        $result[] = new UrlAlternative($site);
+    }
+    if ($result === []) {
+        for ($index = 1;; $index++) {
+            $site = getSite($args, $index, false);
+            if ($site === null) {
+                break;
+            }
+            $result[] = new UrlAlternative($site);
+        }
+    }
+
+    return $result;
+}
+
+function writeOutput(array $alternatives, string $outputFile, array $outputSize): void
+{
+    echo 'Generating gnuplot script... ';
+    $plots = [];
+    foreach ($alternatives as $alternative) {
+        $plots[] = '"' . str_replace(DIRECTORY_SEPARATOR, '/', $alternative->getLastBenchmarkFile()) . '" using 10 smooth sbezier with lines title "' . $alternative->getName() . '"';
+    }
+    if (is_dir('/usr/share/fonts/ttf-liberation')) {
+        $fontCommand = " font 'Liberation Sans,10'";
+        $fontEnvPrefix = 'GDFONTPATH=/usr/share/fonts/ttf-liberation ';
+    } else {
+        $fontCommand = '';
+        $fontEnvPrefix = '';
+    }
+    $plots = implode(', ', $plots);
+    $outputFileForScript = str_replace(DIRECTORY_SEPARATOR, '/', $outputFile);
+    $script = <<<EOT
+set terminal png{$fontCommand} size {$outputSize[0]},{$outputSize[1]}
+set output "{$outputFileForScript}"
+set title "ab-gnuplot results"
+set size 1,1
+set grid y
+set xlabel 'Request'
+set ylabel 'Response Time (ms)'
+plot {$plots}
+exit
+
+EOT
+    ;
+    echo "done.\n";
+    echo 'Generating output image... ';
+    $tempFile = createTemporaryFile();
+    try {
+        file_put_contents($tempFile, $script);
+        $rc = -1;
+        $output = [];
+        exec("{$fontEnvPrefix}gnuplot -c " . escapeshellarg($tempFile) . ' 2>&1', $output, $rc);
+        if ($rc !== 0) {
+            throw ABGPException::generic("gnuplot failed!\n" . trim(implode("\n", $output)));
+        }
+        echo "done.\n";
+    } finally {
+        set_error_handler(static function () {}, -1);
+        unlink($tempFile);
+        restore_error_handler();
+    }
+}
+
+function writeRedoCommand(int $numCycles, string $outputFile, array $outputSize, string $kind, array $alternatives): void
+{
+    printf(
+        <<<EOT
+Going to run the benchmanrk.\nIf you want to execute again this command, simply use these arguments:
+%1\$s={$numCycles} %2\$s={$outputFile} %3\$s=y %4\$s={$outputSize[0]}x{$outputSize[1]} %5\$s={$kind}
+EOT
+        ,
+        OPTION_NUMCYCLES,
+        OPTION_OUTPUTFILE,
+        OPTION_OVERWRITEOUTPUTFILE,
+        OPTION_OUTPUTSIZE,
+        OPTION_KIND
+    );
+    foreach ($alternatives as $index => $alternative) {
+        echo ' ', $alternative->getRedoOptions($index);
+    }
+    echo "\n";
+}
+
+try {
+    $args = new Args();
+    if ($args->get('-h') !== null || $args->get('--help') !== null || $args->get('/?') !== null) {
+        showSyntax($args);
+    } else {
+        if (!commandExists('ab')) {
+            throw ABGPException::commandMissing(
+                'ab',
+                DIRECTORY_SEPARATOR === '\\' ?
+                'You can download a Windows binary distribution of Apache: it includes ab.exe, which should be added to a directory listed your PATH environment variable' :
+                "ab is usually included in package named 'apache2-utils'. You may try to install it with\napt-get install apache2-utils\nor\napk add apache2-utils"
+            );
+        }
+        if (!commandExists('gnuplot')) {
+            throw ABGPException::commandMissing(
+                'ab',
+                DIRECTORY_SEPARATOR === '\\' ?
+                'You can download a Windows compiled version following the instructions at the gnuplot website, then add gnuplot.exe to a directory listed your PATH environment variable' :
+                "ab is usually included in package named 'gnuplot'. You may try to install it with\napt-get install gnuplot\nor\napk add gnuplot"
+            );
+        }
+        $numCycles = getNumCycles($args);
+        $outputFile = getOutputFile($args);
+        $outputSize = getOutputSize($args);
+        $kind = getKind($args);
+        switch ($kind) {
+            case KIND_SWITCHBRANCH:
+                if (!commandExists('git')) {
+                    throw ABGPException::commandMissing(
+                        'git',
+                        DIRECTORY_SEPARATOR === '\\' ?
+                        'You need to install Git for Windows' :
+                        "git is usually included in package named 'git'. You may try to install it with\napt-get install git\nor\napk add git"
+                    );
+                }
+                $alternatives = geSwitchAlternatives($args);
+                break;
+            case KIND_DIFFERENTURLS:
+                $alternatives = getUrlAlternatives($args);
+                break;
+        }
+        $unrecognizedOptions = $args->getKeys();
+        if ($unrecognizedOptions !== []) {
+            throw ABGPException::unrecognizedOptions($unrecognizedOptions);
+        }
+        writeRedoCommand($numCycles, $outputFile, $outputSize, $kind, $alternatives);
+        foreach ($alternatives as $alternative) {
+            $alternative->run($numCycles);
+        }
+        writeOutput($alternatives, $outputFile, $outputSize);
+    }
+    $rc = 0;
+} catch (ABGPException $x) {
+    fwrite(STDERR, rtrim($x->getMessage()) . "\n");
+    $rc = $x->getCode();
+}
+exit($rc);
