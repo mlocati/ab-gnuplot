@@ -1,6 +1,6 @@
 # ab-gnuplot
 
-This project provodes a script that can be used to easily benchmark the response time of different URLs, or the same URL but switching git branches.
+This project provides a script that can be used to easily benchmark the response time of different URLs, or the same URL but switching git branches.
 
 This uses [ab - Apache HTTP server benchmarking tool](https://httpd.apache.org/docs/2.4/programs/ab.html) to collect the statistics, and [gnuplot](http://www.gnuplot.info/) to draw them.
 
