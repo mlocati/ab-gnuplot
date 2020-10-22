@@ -308,7 +308,7 @@ abstract class Alternative
         $response = file_get_contents($this->getSite()->getUrl(), false, $context);
         restore_error_handler();
         if ($response === false) {
-            throw ABGPException::generic("Failed to GET {$this->getSite()->getUrl()} in 10 seconds");
+            throw ABGPException::generic("GET call to {$this->getSite()->getUrl()} failed");
         }
         /**
          * @var array $http_response_header
@@ -543,6 +543,11 @@ function readchar(string $prompt): ?string
 }
 
 function askIPAddressesInDocker(): bool
+{
+    return false;
+}
+
+function hookLocalhostInDocker(): bool
 {
     return isInsideDocker();
 }
@@ -898,6 +903,13 @@ function getSite(Args $args, ?int $index = null, bool $onlyIfAutomatic = false):
         }
     } else {
         $ip = '';
+    }
+    if ($ip === '' && hookLocalhostInDocker()) {
+        $matches = null;
+        if (preg_match('_^(?<pre>\w+://)(localhost|127\.0+\.0+\.0*1|::1)(?<post>[:/?#].*)?$_i', $url, $matches)) {
+            $url = $matches['pre'] . 'localhost' . ($matches['post'] ?? '');
+            $ip = getDockerHostIP();
+        }
     }
 
     return new UrlAndIP($url, $ip);
