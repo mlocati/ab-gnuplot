@@ -26,7 +26,7 @@ Example (when using the script directly):
 
 ### Using the Docker image
 
-You can also use the pre-built `mlocati/ab-gnuplot` Docker image.
+You can also use the pre-built [`mlocati/ab-gnuplot` Docker image](https://hub.docker.com/r/mlocati/ab-gnuplot).
 
 To get help, use the `-h` option.
 
