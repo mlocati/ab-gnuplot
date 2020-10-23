@@ -996,9 +996,10 @@ function writeOutput(array $alternatives, string $outputFile, array $outputSize)
     foreach ($alternatives as $alternative) {
         $plots[] = '"' . str_replace(DIRECTORY_SEPARATOR, '/', $alternative->getLastBenchmarkFile()) . '" using 10 smooth sbezier with lines title "' . $alternative->getName() . '"';
     }
-    if (is_dir('/usr/share/fonts/ttf-liberation')) {
-        $fontCommand = " font 'Liberation Sans,10'";
-        $fontEnvPrefix = 'GDFONTPATH=/usr/share/fonts/ttf-liberation ';
+    $ttfFile = '/usr/share/fonts/ttf-liberation/LiberationSans-Regular.ttf';
+    if (is_file($ttfFile)) {
+        $fontCommand = " font '{$ttfFile},11'";
+        $fontEnvPrefix = 'GDFONTPATH= ';
     } else {
         $fontCommand = '';
         $fontEnvPrefix = '';
