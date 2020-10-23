@@ -751,7 +751,7 @@ function getOutputFile(Args $args): string
     $outputFile = $args->pop(OPTION_OUTPUTFILE);
     if ($outputFile === null) {
         $fromOptions = false;
-        echo 'Specify the number path to the output file: ';
+        echo 'Specify the number path to the output PNG file: ';
         $outputFile = fgets(STDIN);
     } else {
         $fromOptions = true;
