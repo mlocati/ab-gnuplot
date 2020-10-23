@@ -66,10 +66,8 @@ const OPTION_REPODIR = '--dir';
 const KIND_SWITCHBRANCH = 'branch';
 const KIND_DIFFERENTURLS = 'url';
 const OPTION_URL = '--url';
-const OPTION_IP = '--ip';
 const OPTION_COMPOSER = '--composer';
 const OPTION_BRANCH = '--branch';
-const DOCKER_HOSTIP_PLACEHOLDER = '-';
 
 class Args
 {
@@ -304,11 +302,17 @@ abstract class Alternative
                 'ignore_errors' => true,
             ],
         ]);
-        set_error_handler(static function () {}, -1);
+        $error = '';
+        set_error_handler(
+            static function ($errno, $errstr) use (&$error) {
+                $error = preg_replace('/^.*?\): failed to open stream:\s*(\w.+)$/is', '\1', (string) $errstr);
+            },
+            -1
+        );
         $response = file_get_contents($this->getSite()->getUrl(), false, $context);
         restore_error_handler();
         if ($response === false) {
-            throw ABGPException::generic("GET call to {$this->getSite()->getUrl()} failed");
+            throw ABGPException::generic("GET call to {$this->getSite()->getUrl()} failed: {$error}");
         }
         /**
          * @var array $http_response_header
@@ -389,9 +393,6 @@ class SwitchAlternative extends Alternative
                 OPTION_REPODIR . '=' . escapeshellarg($this->getRepoDir()),
                 OPTION_URL . '=' . escapeshellarg($this->getSite()->getUrl()),
             ];
-            if (askIPAddressesInDocker()) {
-                $chunks[] = OPTION_IP . '=' . escapeshellarg($this->getSite()->getIP());
-            }
             $chunks[] = OPTION_COMPOSER . '=' . ($this->isRunComposerInstall() ? 'y' : 'n');
         } else {
             $chunks = [];
@@ -441,9 +442,6 @@ class UrlAlternative extends Alternative
         $chunks = [
             OPTION_URL . ($index + 1) . '=' . escapeshellarg($this->getSite()->getUrl()),
         ];
-        if (askIPAddressesInDocker()) {
-            $chunks[] = OPTION_IP . ($index + 1) . '=' . $this->getSite()->getIP();
-        }
 
         return implode(' ', $chunks);
     }
@@ -471,38 +469,15 @@ EOT
         OPTION_KIND,
         implode('|', [KIND_SWITCHBRANCH, KIND_DIFFERENTURLS])
     );
-    if (askIPAddressesInDocker()) {
-        $dockerSpecificBranch = sprintf(
-            <<<'EOT'
-
-  %1$s=[ip|%2$s] the IP of the website (empty: use DNS, %2$s: use the IP address of the docker host)
-EOT
-            ,
-            OPTION_IP,
-            DOCKER_HOSTIP_PLACEHOLDER
-        );
-        $dockerSpecificUrl = sprintf(
-            <<<'EOT'
-
-  %1$s<1...n>=[ip|%2$s] the IP of the website #n (empty: use DNS, %2$s: use the IP address of the docker host)
-EOT
-            ,
-            OPTION_IP,
-            DOCKER_HOSTIP_PLACEHOLDER
-        );
-    } else {
-        $dockerSpecificBranch = '';
-        $dockerSpecificUrl = '';
-    }
     fprintf(
         STDOUT,
-        <<<EOT
+        <<<'EOT'
 
-When %1\$s is %2\$s:
-  %3\$s=<path> the path to the repository directory
-  %4\$s=<url> the URL to the website{$dockerSpecificBranch}
-  %5\$s=<y|n> run "composer install" after switching branches?
-  %6\$s<1...n>=<branch> the names of the branches to be tested
+When %1$s is %2$s:
+  %3$s=<path> the path to the repository directory
+  %4$s=<url> the URL to the website
+  %5$s=<y|n> run "composer install" after switching branches?
+  %6$s<1...n>=<branch> the names of the branches to be tested
 
 EOT
         ,
@@ -515,17 +490,16 @@ EOT
     );
     fprintf(
         STDOUT,
-        <<<EOT
+        <<<'EOT'
 
-When %1\$s is %2\$s:
-  %3\$s<1...n>=<url> the URL to the website #n{$dockerSpecificUrl}
+When %1$s is %2$s:
+  %3$s<1...n>=<url> the URL to the website #n
 
 EOT
         ,
         OPTION_KIND,
         KIND_DIFFERENTURLS,
-        OPTION_URL,
-        OPTION_IP
+        OPTION_URL
     );
 }
 
@@ -542,14 +516,51 @@ function readchar(string $prompt): ?string
     }
 }
 
-function askIPAddressesInDocker(): bool
+function getIPForUrl(string &$url): string
 {
-    return false;
-}
+    if (isInsideDocker() === false) {
+        return '';
+    }
+    set_error_handler(static function () {}, -1);
+    $host = parse_url($url, PHP_URL_HOST);
+    restore_error_handler();
+    if (empty($host)) {
+        return '';
+    }
+    if ($host === '127.0.0.1' || preg_match('/^\[[0:]*:[0:]*:[0:]*1]$/', $host)) {
+        if (preg_match('_^(?<pre>\w+://)' . preg_quote($host, '_') . '(?<post>([:/?#].*)?)$_', $url, $matches)) {
+            $host = 'localhost';
+            $url = $url = $matches['pre'] . $host . $matches['post'];
+        }
+    }
+    if (strcasecmp($host, 'localhost') === 0) {
+        return getDockerHostIP();
+    }
+    if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false) {
+        return '';
+    }
+    if (preg_match('/^\[(?<IPv6>.+)\]$/', $host, $matches) && filter_var($matches['IPv6'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false) {
+        return '';
+    }
+    set_error_handler(static function () {}, -1);
+    $records = dns_get_record($host, DNS_A | DNS_AAAA);
+    restore_error_handler();
+    if (empty($records)) {
+        return '';
+    }
+    $ip = '';
+    foreach ($records as $record) {
+        switch ($record['type']) {
+            case 'A':
+                $ip = $record['ip'];
+                break 2;
+            case 'AAAA':
+                $ip = $record['ip'];
+                break 1;
+        }
+    }
 
-function hookLocalhostInDocker(): bool
-{
-    return isInsideDocker();
+    return $ip === '127.0.0.1' || $ip === '::1' ? getDockerHostIP() : '';
 }
 
 function isInsideDocker(): bool
@@ -831,24 +842,10 @@ function getKind(Args $args): string
     return $kind;
 }
 
-function fillUrlPlaceholders(string $url): string
-{
-    if (askIPAddressesInDocker()) {
-        $matches = null;
-        $search = preg_quote(DOCKER_HOSTIP_PLACEHOLDER, '_');
-        if (preg_match('_^(?<pre>\w+://)' . $search . '(?<post>[:/?#].*)?$_', $url, $matches)) {
-            $url = $matches['pre'] . getDockerHostIP() . ($matches['post'] ?? '');
-        }
-    }
-
-    return $url;
-}
-
 function getSite(Args $args, ?int $index = null, bool $onlyIfAutomatic = false): ?UrlAndIP
 {
     $url = $args->pop(OPTION_URL . $index);
     if ($url !== null) {
-        $url = fillUrlPlaceholders($url);
         if (filter_var($url, FILTER_VALIDATE_URL) === false) {
             throw ABGPException::invalidOptionValue(OPTION_URL, "{$url} is not a valid URL");
         }
@@ -864,7 +861,6 @@ function getSite(Args $args, ?int $index = null, bool $onlyIfAutomatic = false):
             if ($required === false && $url === '') {
                 return null;
             }
-            $url = fillUrlPlaceholders($url);
             if (filter_var($url, FILTER_VALIDATE_URL) !== false) {
                 break;
             }
@@ -874,43 +870,7 @@ function getSite(Args $args, ?int $index = null, bool $onlyIfAutomatic = false):
     if (preg_match('_^\w+://[^/]+$_', $url)) {
         $url .= '/';
     }
-    if (askIPAddressesInDocker()) {
-        $ip = $args->pop(OPTION_IP . $index);
-        if ($ip !== null) {
-            if (strcasecmp($ip, DOCKER_HOSTIP_PLACEHOLDER) === 0) {
-                $ip = getDockerHostIP();
-            }
-            if ($ip !== '' && filter_var($ip, FILTER_VALIDATE_IP) === false) {
-                throw ABGPException::invalidOptionValue(OPTION_URL, "{$ip} is not a IP address");
-            }
-        } elseif (preg_match('_^\w+://(?<ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b_i', $url)) {
-            $ip = '';
-        } else {
-            echo 'If required, specify the IP at witch the website is available (to specify the Docker host IP, specify ', DOCKER_HOSTIP_PLACEHOLDER, '): ';
-            for (;;) {
-                $ip = trim(fgets(STDIN));
-                if ($ip !== '') {
-                    if (strcasecmp($ip, DOCKER_HOSTIP_PLACEHOLDER) === 0) {
-                        $ip = getDockerHostIP();
-                    }
-                    if (filter_var($ip, FILTER_VALIDATE_IP) === false) {
-                        echo 'Invalid IP. Try again: ';
-                        continue;
-                    }
-                }
-                break;
-            }
-        }
-    } else {
-        $ip = '';
-    }
-    if ($ip === '' && hookLocalhostInDocker()) {
-        $matches = null;
-        if (preg_match('_^(?<pre>\w+://)(localhost|127\.0+\.0+\.0*1|::1)(?<post>[:/?#].*)?$_i', $url, $matches)) {
-            $url = $matches['pre'] . 'localhost' . ($matches['post'] ?? '');
-            $ip = getDockerHostIP();
-        }
-    }
+    $ip = getIPForUrl($url);
 
     return new UrlAndIP($url, $ip);
 }
