@@ -647,7 +647,7 @@ function getGitBranches(string $repoDir, bool $refresh = false): array
     }
     $rc = -1;
     $output = [];
-    exec('git -C ' . escapeshellarg($repoDir) . " branch --list --no-color --sort='-committerdate' --format='%(refname:short)' 2>&1", $output, $rc);
+    exec('git -C ' . escapeshellarg($repoDir) . ' branch --list --no-color --sort="-committerdate" --format="%(refname:short)" 2>&1', $output, $rc);
     if ($rc !== 0) {
         throw ABGPException::generic("Failed to list the local branches in {$repoDir}: " . trim(implode("\n", $output)));
     }
