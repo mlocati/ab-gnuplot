@@ -258,13 +258,13 @@ abstract class Alternative
         try {
             echo 'Checking response... ';
             $this->checkResponse();
-            echo " done.\n";
+            echo "done.\n";
             echo 'Warm-up... ';
             $this->warmUp();
-            echo " done.\n";
+            echo "done.\n";
             echo 'Checking response... ';
             $this->checkResponse();
-            echo " done.\n";
+            echo "done.\n";
             $tempFile = createTemporaryFile();
             $rc = -1;
             echo "Running {$numCycles} cycles\n";
